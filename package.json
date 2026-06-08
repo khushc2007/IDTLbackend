@@ -1,0 +1,33 @@
+{
+  "name": "water-iq-backend",
+  "version": "1.0.0",
+  "description": "Water IQ greywater quality monitoring backend for Render deployment",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "seed": "node seed.js"
+  },
+  "keywords": [
+    "water-quality",
+    "iot",
+    "esp32",
+    "sensor",
+    "monitoring"
+  ],
+  "author": "Khush & Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "better-sqlite3": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
