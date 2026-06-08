@@ -15,25 +15,54 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const dbPath = path.join(__dirname, 'data', 'wateriq.db');
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
 let db = null;
 let SQL = null;
 
-// Initialize database
+// ─── FILTRATION BRACKET REFERENCE ────────────────────────────────────────────
+//  F1  turbidity ≤ 10 NTU,  tds < 1000 ppm  →  Sediment + Carbon  →  Route to reuse
+//  F2  turbidity 10–30 NTU, tds < 1000 ppm  →  Sand + Carbon      →  Route to reuse
+//  F3  turbidity > 30 NTU,  tds < 1000 ppm  →  Coagulation + Sand →  Treat further
+//  F4  any turbidity,        tds 1000–1500   →  Advanced treatment →  Discard recommended
+//  F5  any turbidity,        tds > 1500      →  RO / Disposal      →  Hard discard
+// ─────────────────────────────────────────────────────────────────────────────
+
+const BRACKETS = {
+  F1: { label: 'F1', turbidityRange: '≤ 10 NTU',   tdsRange: '< 1000 ppm',    method: 'Sediment + Carbon', outcome: 'Route to reuse',      severity: 'safe'     },
+  F2: { label: 'F2', turbidityRange: '10–30 NTU',  tdsRange: '< 1000 ppm',    method: 'Sand + Carbon',     outcome: 'Route to reuse',      severity: 'safe'     },
+  F3: { label: 'F3', turbidityRange: '> 30 NTU',   tdsRange: '< 1000 ppm',    method: 'Coagulation + Sand',outcome: 'Treat further',       severity: 'warning'  },
+  F4: { label: 'F4', turbidityRange: '—',           tdsRange: '1000–1500 ppm', method: 'Advanced treatment',outcome: 'Discard recommended', severity: 'danger'   },
+  F5: { label: 'F5', turbidityRange: '—',           tdsRange: '> 1500 ppm',    method: 'RO / Disposal',     outcome: 'Hard discard',        severity: 'critical' },
+};
+
+function classifyBracket(tds, turbidity) {
+  if (tds > 1500)                         return BRACKETS.F5;
+  if (tds >= 1000 && tds <= 1500)         return BRACKETS.F4;
+  if (turbidity > 30)                     return BRACKETS.F3;
+  if (turbidity >= 10 && turbidity <= 30) return BRACKETS.F2;
+  return BRACKETS.F1;
+}
+
+function deriveStatus(bracket) {
+  if (bracket.severity === 'warning')                                return 'WARNING';
+  if (bracket.severity === 'danger' || bracket.severity === 'critical') return 'CRITICAL';
+  return 'STABLE';
+}
+
+// ─── DATABASE ─────────────────────────────────────────────────────────────────
+
 async function initializeDatabase() {
   SQL = await initSqlJs();
-  
+
   let data;
   if (fs.existsSync(dbPath)) {
     data = fs.readFileSync(dbPath);
   }
-  
+
   db = new SQL.Database(data);
 
-  // Create tables if they don't exist
   db.run(`
     CREATE TABLE IF NOT EXISTS readings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,6 +71,7 @@ async function initializeDatabase() {
       turbidity REAL,
       ph REAL,
       status TEXT DEFAULT 'STABLE',
+      bracket TEXT DEFAULT 'F1',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -62,7 +92,11 @@ async function initializeDatabase() {
     );
   `);
 
-  // Initialize pump state if empty
+  // Add bracket column if upgrading from old schema
+  try {
+    db.run('ALTER TABLE readings ADD COLUMN bracket TEXT DEFAULT "F1"');
+  } catch (_) { /* column already exists */ }
+
   const pumpResult = db.exec('SELECT COUNT(*) as count FROM pump_state');
   if (!pumpResult.length || pumpResult[0].values[0][0] === 0) {
     db.run('INSERT INTO pump_state (status) VALUES (?)', ['OFF']);
@@ -71,317 +105,262 @@ async function initializeDatabase() {
   saveDatabase();
 }
 
-// Save database to file
 function saveDatabase() {
   if (!fs.existsSync(path.join(__dirname, 'data'))) {
     fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
   }
   const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(dbPath, buffer);
+  fs.writeFileSync(dbPath, Buffer.from(data));
 }
 
-// Helper to run queries and get results
 function getQueryResults(query, params = []) {
   const stmt = db.prepare(query);
   stmt.bind(params);
   const results = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject());
-  }
+  while (stmt.step()) results.push(stmt.getAsObject());
   stmt.free();
   return results;
 }
 
-// Function to generate realistic sensor data
+// ─── SIMULATION ───────────────────────────────────────────────────────────────
+
 function generateReading() {
-  const tds = 300 + Math.random() * 400 + Math.sin(Date.now() / 10000) * 100;
-  const turbidity = 2 + Math.random() * 3 + Math.cos(Date.now() / 15000) * 1;
-  const ph = 7.0 + Math.random() * 1 + Math.sin(Date.now() / 12000) * 0.3;
-
-  let status = 'STABLE';
-  if (tds > 1200 || turbidity > 5 || ph < 6.5 || ph > 8.5) {
-    status = 'WARNING';
-  }
-  if (tds > 1500 || turbidity > 7 || ph < 6 || ph > 9) {
-    status = 'CRITICAL';
-  }
-
-  return {
-    tds: parseFloat(tds.toFixed(2)),
-    turbidity: parseFloat(turbidity.toFixed(2)),
-    ph: parseFloat(ph.toFixed(2)),
-    status,
-  };
+  const t = Date.now();
+  const tds       = parseFloat((400  + Math.random() * 1300 + Math.sin(t / 10000) * 200).toFixed(2));
+  const turbidity = parseFloat((2    + Math.random() * 45   + Math.cos(t / 15000) * 5  ).toFixed(2));
+  const ph        = parseFloat((6.8  + Math.random() * 1.5  + Math.sin(t / 12000) * 0.4).toFixed(2));
+  const bracket   = classifyBracket(tds, turbidity);
+  return { tds, turbidity, ph, status: deriveStatus(bracket), bracket: bracket.label };
 }
 
-// Routes
+function insertReading({ tds, turbidity, ph, status, bracket }) {
+  const stmt = db.prepare(
+    'INSERT INTO readings (tds, turbidity, ph, status, bracket) VALUES (?, ?, ?, ?, ?)'
+  );
+  stmt.bind([tds, turbidity, ph, status, bracket]);
+  stmt.step();
+  stmt.free();
+  saveDatabase();
+}
 
-// GET /api/readings - Get sensor readings
-app.get('/api/readings', (req, res) => {
+// ─── ROUTES ───────────────────────────────────────────────────────────────────
+
+// GET /api/live — latest reading with full bracket detail (poll every 1s)
+app.get('/api/live', (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 500);
-    const readings = getQueryResults(`
-      SELECT id, timestamp, tds, turbidity, ph, status, created_at
-      FROM readings
-      ORDER BY created_at DESC
-      LIMIT ?
-    `, [limit]);
+    const rows = getQueryResults(
+      'SELECT * FROM readings ORDER BY created_at DESC LIMIT 1'
+    );
+    if (!rows.length) return res.json({ success: true, data: null });
 
+    const row = rows[0];
+    const bracketKey = row.bracket || 'F1';
     res.json({
       success: true,
-      count: readings.length,
-      data: readings,
+      data: {
+        ...row,
+        bracketDetail: BRACKETS[bracketKey] ?? BRACKETS.F1,
+        allBrackets: BRACKETS,
+      },
     });
   } catch (error) {
-    console.error('Error fetching readings:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET /api/readings/stats - Get statistics
+// GET /api/readings
+app.get('/api/readings', (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 500);
+    const readings = getQueryResults(
+      'SELECT id, timestamp, tds, turbidity, ph, status, bracket, created_at FROM readings ORDER BY created_at DESC LIMIT ?',
+      [limit]
+    );
+    res.json({ success: true, count: readings.length, data: readings });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/readings/stats
 app.get('/api/readings/stats', (req, res) => {
   try {
-    const hours = parseInt(req.query.hours) || 24;
-    
-    // For sql.js, we need to do a simpler approach
-    const readings = getQueryResults(`
-      SELECT tds, turbidity, ph
-      FROM readings
-      ORDER BY created_at DESC
-      LIMIT 1000
-    `);
+    const readings = getQueryResults(
+      'SELECT tds, turbidity, ph FROM readings ORDER BY created_at DESC LIMIT 1000'
+    );
 
-    if (readings.length === 0) {
+    if (!readings.length) {
       return res.json({
         success: true,
-        hours,
         data: {
-          avg_tds: 0,
-          avg_turbidity: 0,
-          avg_ph: 0,
-          min_tds: 0,
-          max_tds: 0,
-          min_turbidity: 0,
-          max_turbidity: 0,
-          min_ph: 0,
-          max_ph: 0,
+          avg_tds: 0, avg_turbidity: 0, avg_ph: 0,
+          min_tds: 0, max_tds: 0,
+          min_turbidity: 0, max_turbidity: 0,
+          min_ph: 0, max_ph: 0,
           total_readings: 0,
         },
       });
     }
 
-    const stats = {
-      avg_tds: readings.reduce((a, r) => a + r.tds, 0) / readings.length,
-      avg_turbidity: readings.reduce((a, r) => a + r.turbidity, 0) / readings.length,
-      avg_ph: readings.reduce((a, r) => a + r.ph, 0) / readings.length,
-      min_tds: Math.min(...readings.map(r => r.tds)),
-      max_tds: Math.max(...readings.map(r => r.tds)),
-      min_turbidity: Math.min(...readings.map(r => r.turbidity)),
-      max_turbidity: Math.max(...readings.map(r => r.turbidity)),
-      min_ph: Math.min(...readings.map(r => r.ph)),
-      max_ph: Math.max(...readings.map(r => r.ph)),
-      total_readings: readings.length,
-    };
+    const avg = (arr, key) => arr.reduce((a, r) => a + r[key], 0) / arr.length;
+    const toF = n => parseFloat(n.toFixed(2));
 
     res.json({
       success: true,
-      hours,
       data: {
-        avg_tds: parseFloat(stats.avg_tds.toFixed(2)),
-        avg_turbidity: parseFloat(stats.avg_turbidity.toFixed(2)),
-        avg_ph: parseFloat(stats.avg_ph.toFixed(2)),
-        min_tds: parseFloat(stats.min_tds.toFixed(2)),
-        max_tds: parseFloat(stats.max_tds.toFixed(2)),
-        min_turbidity: parseFloat(stats.min_turbidity.toFixed(2)),
-        max_turbidity: parseFloat(stats.max_turbidity.toFixed(2)),
-        min_ph: parseFloat(stats.min_ph.toFixed(2)),
-        max_ph: parseFloat(stats.max_ph.toFixed(2)),
-        total_readings: stats.total_readings,
+        avg_tds:        toF(avg(readings, 'tds')),
+        avg_turbidity:  toF(avg(readings, 'turbidity')),
+        avg_ph:         toF(avg(readings, 'ph')),
+        min_tds:        toF(Math.min(...readings.map(r => r.tds))),
+        max_tds:        toF(Math.max(...readings.map(r => r.tds))),
+        min_turbidity:  toF(Math.min(...readings.map(r => r.turbidity))),
+        max_turbidity:  toF(Math.max(...readings.map(r => r.turbidity))),
+        min_ph:         toF(Math.min(...readings.map(r => r.ph))),
+        max_ph:         toF(Math.max(...readings.map(r => r.ph))),
+        total_readings: readings.length,
       },
     });
   } catch (error) {
-    console.error('Error fetching stats:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// POST /api/readings - Add a new sensor reading
+// POST /api/readings — ESP32 posts here
 app.post('/api/readings', (req, res) => {
   try {
-    const { tds, turbidity, ph, status } = req.body;
+    const { tds, turbidity, ph } = req.body;
 
     if (tds === undefined || turbidity === undefined || ph === undefined) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: tds, turbidity, ph',
-      });
+      return res.status(400).json({ success: false, error: 'Missing required fields: tds, turbidity, ph' });
     }
 
-    const stmt = db.prepare(`
-      INSERT INTO readings (tds, turbidity, ph, status)
-      VALUES (?, ?, ?, ?)
-    `);
-    stmt.bind([tds, turbidity, ph, status || 'STABLE']);
-    stmt.step();
-    stmt.free();
-    
-    saveDatabase();
+    const bracket = classifyBracket(parseFloat(tds), parseFloat(turbidity));
+    const status  = deriveStatus(bracket);
+
+    insertReading({ tds, turbidity, ph, status, bracket: bracket.label });
 
     res.status(201).json({
       success: true,
-      message: 'Reading saved successfully',
+      message: 'Reading saved',
+      bracket: bracket.label,
+      method:  bracket.method,
+      outcome: bracket.outcome,
+      status,
     });
   } catch (error) {
-    console.error('Error saving reading:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET /api/pump - Get current pump state
+// GET /api/pump
 app.get('/api/pump', (req, res) => {
   try {
     const pumpState = getQueryResults('SELECT status, last_updated FROM pump_state LIMIT 1');
-    res.json({
-      success: true,
-      data: pumpState[0] || { status: 'OFF' },
-    });
+    res.json({ success: true, data: pumpState[0] || { status: 'OFF' } });
   } catch (error) {
-    console.error('Error fetching pump state:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// POST /api/pump - Control pump
+// POST /api/pump
 app.post('/api/pump', (req, res) => {
   try {
     const { action } = req.body;
-
     if (!action || !['on', 'off'].includes(action.toLowerCase())) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid action. Use "on" or "off"',
-      });
+      return res.status(400).json({ success: false, error: 'Invalid action. Use "on" or "off"' });
     }
-
     const status = action.toUpperCase();
     const stmt = db.prepare('UPDATE pump_state SET status = ?, last_updated = CURRENT_TIMESTAMP WHERE id = 1');
     stmt.bind([status]);
     stmt.step();
     stmt.free();
-    
     saveDatabase();
-
-    res.json({
-      success: true,
-      message: `Pump turned ${status}`,
-      status,
-    });
+    res.json({ success: true, message: `Pump turned ${status}`, status });
   } catch (error) {
-    console.error('Error controlling pump:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET /api/alerts - Get recent alerts
+// GET /api/alerts
 app.get('/api/alerts', (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 20, 100);
-    const alerts = getQueryResults(`
-      SELECT * FROM alerts
-      ORDER BY created_at DESC
-      LIMIT ?
-    `, [limit]);
-
-    res.json({
-      success: true,
-      count: alerts.length,
-      data: alerts,
-    });
+    const alerts = getQueryResults('SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?', [limit]);
+    res.json({ success: true, count: alerts.length, data: alerts });
   } catch (error) {
-    console.error('Error fetching alerts:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// POST /api/seed - Seed database with mock data
+// POST /api/seed
 app.post('/api/seed', (req, res) => {
   try {
-    const count = Math.min(parseInt(req.body.count) || 50, 500);
-    const stmt = db.prepare('INSERT INTO readings (tds, turbidity, ph, status, created_at) VALUES (?, ?, ?, ?, ?)');
-
+    const count = Math.min(parseInt(req.body?.count) || 50, 500);
+    const stmt = db.prepare(
+      'INSERT INTO readings (tds, turbidity, ph, status, bracket, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    );
     for (let i = 0; i < count; i++) {
-      const reading = generateReading();
-      const pastTime = new Date(Date.now() - i * 60000);
-      const timestampStr = pastTime.toISOString();
-      
-      stmt.bind([reading.tds, reading.turbidity, reading.ph, reading.status, timestampStr]);
+      const r = generateReading();
+      const ts = new Date(Date.now() - i * 1000).toISOString();
+      stmt.bind([r.tds, r.turbidity, r.ph, r.status, r.bracket, ts]);
       stmt.step();
       stmt.reset();
     }
     stmt.free();
-
     saveDatabase();
-
-    res.json({
-      success: true,
-      message: `Seeded ${count} mock readings`,
-      count,
-    });
+    res.json({ success: true, message: `Seeded ${count} readings`, count });
   } catch (error) {
-    console.error('Error seeding data:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET /api/health - Health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    success: true,
-    message: 'Water IQ Backend is running',
-    timestamp: new Date().toISOString(),
-  });
+// GET /api/health
+app.get('/api/health', (_req, res) => {
+  res.json({ success: true, message: 'Water IQ Backend is running', timestamp: new Date().toISOString() });
 });
 
-// Root endpoint
-app.get('/', (req, res) => {
+// GET /
+app.get('/', (_req, res) => {
   res.json({
     service: 'Water IQ Backend',
-    version: '1.0.0',
-    database: 'sql.js (in-memory with file persistence)',
+    version: '2.0.0',
     endpoints: {
-      readings: 'GET /api/readings',
-      readingsStats: 'GET /api/readings/stats',
-      addReading: 'POST /api/readings',
-      pumpStatus: 'GET /api/pump',
-      pumpControl: 'POST /api/pump',
-      alerts: 'GET /api/alerts',
-      seedData: 'POST /api/seed',
-      health: 'GET /api/health',
+      live:          'GET  /api/live',
+      readings:      'GET  /api/readings',
+      readingsStats: 'GET  /api/readings/stats',
+      addReading:    'POST /api/readings',
+      pumpStatus:    'GET  /api/pump',
+      pumpControl:   'POST /api/pump',
+      alerts:        'GET  /api/alerts',
+      seedData:      'POST /api/seed',
+      health:        'GET  /api/health',
     },
   });
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
+app.use((err, _req, res, _next) => {
   console.error(err.stack);
-  res.status(500).json({
-    success: false,
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : undefined,
-  });
+  res.status(500).json({ success: false, error: 'Internal server error' });
 });
 
-// Start server
+// ─── START ────────────────────────────────────────────────────────────────────
+
 async function start() {
   try {
     await initializeDatabase();
     console.log('✅ Database initialized');
-    
+
     app.listen(PORT, () => {
       console.log(`🌊 Water IQ Backend running on port ${PORT}`);
-      console.log(`📊 API docs available at http://localhost:${PORT}/`);
     });
+
+    // Auto-simulate a reading every 1s when ESP32 is not connected
+    setInterval(() => {
+      try {
+        insertReading(generateReading());
+      } catch (_) { /* silent */ }
+    }, 1000);
+
   } catch (error) {
     console.error('Failed to start:', error);
     process.exit(1);
